@@ -1,0 +1,897 @@
+/*********************************************************************
+  Tutorial: RP2040 USB Host Keyboard Remapper + Macro Pad (pass-through by default)
+  ===================================================================
+
+  What this is
+  ------------
+  This sketch turns an Adafruit Feather RP2040 USB Host into a "keyboard in the middle":
+
+    PC  <--- USB-C --->  Feather RP2040 USB Host  <--- USB-A --->  Keyboard
+
+  The Feather does two jobs at once:
+    1) USB Host (USB-A port): reads reports from a real keyboard you plug in.
+    2) USB Device (USB-C port): pretends to be a USB keyboard to your PC.
+
+  That lets you:
+    - pass keys through unchanged (default)
+    - remap keys (CapsLock -> Escape, etc.)
+    - trigger macros (press a key -> emit a key sequence or text)
+
+  Libraries you must install
+  --------------------------
+  In Arduino IDE: Sketch -> Include Library -> Manage Libraries...
+    - Adafruit TinyUSB Library
+    - Pico PIO USB (sekigon-gonnoc)
+
+  Tools menu settings that matter (Arduino IDE)
+  ---------------------------------------------
+  Tools -> USB Stack:   Adafruit TinyUSB
+  Tools -> CPU Speed:   120 MHz or 240 MHz
+
+  Why CPU Speed matters:
+    RP2040 host mode here uses PIO USB bit-banging. It requires CPU clock to be a
+    multiple of 12 MHz. 200 MHz is not divisible by 12, so host mode will refuse to run.
+
+  Files that must be in the sketch folder
+  ---------------------------------------
+  Arduino sketches can include local headers with #include "file.h", but the file must
+  exist in the same sketch directory.
+  You need:
+    - this .ino file
+    - usbh_helper.h  (from Adafruit's DualRole HID remapper example folder)
+
+  Default behavior
+  ----------------
+  This file is set up as a normal keyboard pass-through by default:
+    - macros are disabled
+    - remap table is empty
+    - all incoming reports are forwarded to the PC unchanged
+
+  How to customize (only 3 places)
+  -------------------------------
+  (A) Turn on debug printing to discover keycodes:
+      set DEBUG_PRINT_REPORTS = true;
+
+  (B) Add simple remaps (key -> key):
+      edit key_remaps[] in the "Simple key remaps" section.
+
+  (C) Enable macros (key -> sequence):
+      set ENABLE_MACROS = true;
+      uncomment or write macro steps in "Example macros"
+      add entries in macro_bindings[].
+
+  A note about "all keys"
+  -----------------------
+  HID defines lots of key usages. This sketch uses the standard 8-byte "boot keyboard"
+  report format (modifier + 6 keycodes). That covers typical keyboard keys.
+  It does not include media/consumer keys by default.
+
+*********************************************************************/
+
+
+// ================================================================
+// 1) Host setup helper (comes from Adafruit example folder)
+// ================================================================
+//
+// This header creates the global USBHost object and configures host mode.
+// For RP2040 it also:
+//   - enables the USB-A 5V power switch pin
+//   - sets the PIO USB D+ pin (and D- as next pin)
+//   - checks CPU clock is multiple of 12 MHz
+//
+#include "usbh_helper.h"
+
+
+// ================================================================
+// 2) Device-side: describe ourselves to the PC as a USB keyboard
+// ================================================================
+//
+// This descriptor says: "I am a USB keyboard".
+//
+uint8_t const desc_hid_report[] = {
+  TUD_HID_REPORT_DESC_KEYBOARD()
+};
+
+// This is the "USB keyboard device" object the PC sees.
+Adafruit_USBD_HID usb_hid(
+  desc_hid_report,
+  sizeof(desc_hid_report),
+  HID_ITF_PROTOCOL_KEYBOARD,
+  2,      // polling interval in ms
+  false   // no OUT endpoint
+);
+
+
+// ================================================================
+// 3) User options (edit these first)
+// ================================================================
+
+static bool const DEBUG_PRINT_REPORTS   = false;  // prints incoming reports to Serial
+static bool const PASS_THROUGH_DEFAULT  = true;   // forward to PC when no macro triggers
+static bool const ENABLE_MACROS         = false;  // off by default, you must enable
+
+// Timing knobs for macro reliability
+static uint16_t const TAP_DOWN_MS       = 8;      // key down duration
+static uint16_t const STEP_GAP_MS       = 6;      // gap between macro steps
+static uint16_t const TEXT_CHAR_GAP_MS  = 0;      // extra gap between typed characters (optional)
+
+
+// ================================================================
+// 4) Key reference (names you can use in remaps/macros)
+// ================================================================
+/*
+  Modifiers: report->modifier is a bitmask:
+    KEYBOARD_MODIFIER_LEFTCTRL
+    KEYBOARD_MODIFIER_LEFTSHIFT
+    KEYBOARD_MODIFIER_LEFTALT
+    KEYBOARD_MODIFIER_LEFTGUI
+    KEYBOARD_MODIFIER_RIGHTCTRL
+    KEYBOARD_MODIFIER_RIGHTSHIFT
+    KEYBOARD_MODIFIER_RIGHTALT
+    KEYBOARD_MODIFIER_RIGHTGUI
+
+  Letters:
+    HID_KEY_A ... HID_KEY_Z
+
+  Number row:
+    HID_KEY_1 ... HID_KEY_0
+
+  Common controls:
+    HID_KEY_ENTER, HID_KEY_ESCAPE, HID_KEY_BACKSPACE, HID_KEY_TAB, HID_KEY_SPACE
+
+  Punctuation (US layout labels):
+    HID_KEY_MINUS, HID_KEY_EQUAL, HID_KEY_BRACKET_LEFT, HID_KEY_BRACKET_RIGHT,
+    HID_KEY_BACKSLASH, HID_KEY_SEMICOLON, HID_KEY_APOSTROPHE, HID_KEY_GRAVE,
+    HID_KEY_COMMA, HID_KEY_PERIOD, HID_KEY_SLASH
+
+  Function keys:
+    HID_KEY_F1 ... HID_KEY_F12
+    HID_KEY_F13 ... HID_KEY_F24
+
+  Navigation:
+    HID_KEY_INSERT, HID_KEY_HOME, HID_KEY_PAGE_UP,
+    HID_KEY_DELETE, HID_KEY_END, HID_KEY_PAGE_DOWN
+
+  Arrows:
+    HID_KEY_ARROW_RIGHT, HID_KEY_ARROW_LEFT, HID_KEY_ARROW_DOWN, HID_KEY_ARROW_UP
+
+  Locks:
+    HID_KEY_CAPS_LOCK, HID_KEY_SCROLL_LOCK, HID_KEY_NUM_LOCK
+
+  Keypad:
+    HID_KEY_KEYPAD_NUM_LOCK, HID_KEY_KEYPAD_DIVIDE, HID_KEY_KEYPAD_MULTIPLY,
+    HID_KEY_KEYPAD_SUBTRACT, HID_KEY_KEYPAD_ADD, HID_KEY_KEYPAD_ENTER,
+    HID_KEY_KEYPAD_1 ... HID_KEY_KEYPAD_0, HID_KEY_KEYPAD_DECIMAL
+
+  Shortcut examples (use in macros):
+    Ctrl+C: modifier=KEYBOARD_MODIFIER_LEFTCTRL, key=HID_KEY_C
+    Ctrl+V: modifier=KEYBOARD_MODIFIER_LEFTCTRL, key=HID_KEY_V
+    Ctrl+Z: modifier=KEYBOARD_MODIFIER_LEFTCTRL, key=HID_KEY_Z
+    Ctrl+S: modifier=KEYBOARD_MODIFIER_LEFTCTRL, key=HID_KEY_S
+    Alt+Tab: modifier=KEYBOARD_MODIFIER_LEFTALT, key=HID_KEY_TAB
+*/
+
+
+
+
+
+
+
+
+/* ================================================================
+   Macro ideas by program (COMMENTED OUT)
+   ================================================================
+   How to use:
+     1) Copy any macro block(s) you want into the "Example macros" section
+        (where MacroStep const MACRO_...[] live).
+     2) Then add a binding in macro_bindings[] that points at the macro.
+     3) Keep the text placeholders like <YOUR_TEXT> and edit them yourself.
+
+   Notes:
+     - Many shortcuts depend on OS + app settings + keyboard layout.
+     - Some are "conventions" (e.g., Ctrl+L in browsers) rather than guaranteed.
+     - For app-specific actions without a stable shortcut, you can still do:
+         Ctrl+F, type, Enter
+       but that assumes focus is in the right place.
+
+   Helper patterns used below:
+     { OP_TAP,   <MOD>, <KEY>, 0, nullptr }
+     { OP_DELAY, 0, 0,  <ms>,  nullptr }
+     { OP_TEXT,  0, 0,  0,     "<YOUR_TEXT>" }
+     { OP_TAP,   0, HID_KEY_ENTER, 0, nullptr }
+
+   Make sure you have:
+     ENABLE_MACROS = true
+   ================================================================ */
+
+
+/* --------------------------
+   Global / universal-ish
+   -------------------------- */
+
+// Save
+// static MacroStep const MACRO_SAVE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_S, 0, nullptr },
+// };
+
+// Save As
+// static MacroStep const MACRO_SAVE_AS[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_S, 0, nullptr }, // sometimes opens Save As, sometimes Save
+//   // Alternative common Save As:
+//   // { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_SHIFT, 0, nullptr }, // not valid; SHIFT is a modifier, not a keycode
+// };
+
+// Copy / Paste / Cut
+// static MacroStep const MACRO_COPY[]  = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_C, 0, nullptr }, };
+// static MacroStep const MACRO_PASTE[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_V, 0, nullptr }, };
+// static MacroStep const MACRO_CUT[]   = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_X, 0, nullptr }, };
+
+// Undo / Redo
+// static MacroStep const MACRO_UNDO[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Z, 0, nullptr }, };
+// static MacroStep const MACRO_REDO[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Y, 0, nullptr }, };
+
+// Find / Replace
+// static MacroStep const MACRO_FIND[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_F, 0, nullptr }, };
+// static MacroStep const MACRO_REPLACE[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_H, 0, nullptr }, };
+
+// Switch apps
+// static MacroStep const MACRO_ALT_TAB[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTALT, HID_KEY_TAB, 0, nullptr },
+// };
+
+
+/* --------------------------
+   Notepad++ (Windows)
+   -------------------------- */
+
+// Toggle comment (default: Ctrl+Q in Notepad++ for line comment toggle)
+// static MacroStep const MACRO_NPP_TOGGLE_COMMENT[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Q, 0, nullptr },
+// };
+
+// Duplicate current line (default: Ctrl+D)
+// static MacroStep const MACRO_NPP_DUP_LINE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_D, 0, nullptr },
+// };
+
+// Find next (F3) / Find previous (Shift+F3)
+// static MacroStep const MACRO_NPP_FIND_NEXT[] = {
+//   { OP_TAP, 0, HID_KEY_F3, 0, nullptr },
+// };
+// static MacroStep const MACRO_NPP_FIND_PREV[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_F3, 0, nullptr },
+// };
+
+
+/* --------------------------
+   Microsoft Excel
+   -------------------------- */
+
+// New line inside a cell (Alt+Enter)
+// static MacroStep const MACRO_EXCEL_CELL_NEWLINE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTALT, HID_KEY_ENTER, 0, nullptr },
+// };
+
+// Edit active cell (F2)
+// static MacroStep const MACRO_EXCEL_EDIT_CELL[] = {
+//   { OP_TAP, 0, HID_KEY_F2, 0, nullptr },
+// };
+
+// Go to (Ctrl+G) then type a cell reference, Enter
+// static MacroStep const MACRO_EXCEL_GOTO_CELL[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_G, 0, nullptr },
+//   { OP_DELAY, 0, 0, 50, nullptr },
+//   { OP_TEXT, 0, 0, 0, "<CELL_REF>", },  // e.g. "B12"
+//   { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+// Autofit column width (Alt, H, O, I) uses ribbon keytips.
+// This can be brittle across versions/language. Use only if you accept fragility.
+// static MacroStep const MACRO_EXCEL_AUTOFIT_COLUMN[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTALT, HID_KEY_H, 0, nullptr },
+//   { OP_DELAY, 0, 0, 60, nullptr },
+//   { OP_TAP, 0, HID_KEY_O, 0, nullptr },
+//   { OP_DELAY, 0, 0, 60, nullptr },
+//   { OP_TAP, 0, HID_KEY_I, 0, nullptr },
+// };
+
+
+/* --------------------------
+   Microsoft Word
+   -------------------------- */
+
+// Bold / Italic / Underline
+// static MacroStep const MACRO_WORD_BOLD[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_B, 0, nullptr },
+// };
+// static MacroStep const MACRO_WORD_ITALIC[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_I, 0, nullptr },
+// };
+// static MacroStep const MACRO_WORD_UNDERLINE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_U, 0, nullptr },
+// };
+
+// Paste without formatting (commonly: Ctrl+Alt+V then choose "Unformatted Text")
+// Exact behavior depends on Word version/settings.
+// static MacroStep const MACRO_WORD_PASTE_UNFORMATTED_HINT[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTALT, HID_KEY_V, 0, nullptr },
+//   { OP_DELAY, 0, 0, 120, nullptr },
+//   // You may need to type a letter or arrow to select option; placeholder:
+//   { OP_TEXT, 0, 0, 0, "<OPTION_KEY>", },
+//   { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+
+/* --------------------------
+   paint.net (Windows)
+   -------------------------- */
+
+// Undo / Redo
+// static MacroStep const MACRO_PDN_UNDO[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Z, 0, nullptr }, };
+// static MacroStep const MACRO_PDN_REDO[] = { { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Y, 0, nullptr }, };
+
+// Zoom in / out (Ctrl + +/-) typical
+// static MacroStep const MACRO_PDN_ZOOM_IN[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_EQUAL, 0, nullptr }, // '=' key is often '+' when shifted
+// };
+// static MacroStep const MACRO_PDN_ZOOM_OUT[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_MINUS, 0, nullptr },
+// };
+
+// Fit to window (common: Ctrl+0 in some apps; verify in paint.net)
+// static MacroStep const MACRO_PDN_FIT_TO_WINDOW[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_0, 0, nullptr },
+// };
+
+
+/* --------------------------
+   Chrome / Browsers
+   -------------------------- */
+
+// Address bar focus (Ctrl+L)
+// static MacroStep const MACRO_BROWSER_FOCUS_URL[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_L, 0, nullptr },
+// };
+
+// New tab / close tab / reopen closed tab
+// static MacroStep const MACRO_BROWSER_NEW_TAB[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_T, 0, nullptr },
+// };
+// static MacroStep const MACRO_BROWSER_CLOSE_TAB[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_W, 0, nullptr },
+// };
+// static MacroStep const MACRO_BROWSER_REOPEN_TAB[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_T, 0, nullptr },
+// };
+
+// Open a specific URL
+// static MacroStep const MACRO_BROWSER_OPEN_URL[] = {
+//   { OP_TAP,   KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_L, 0, nullptr },
+//   { OP_DELAY, 0, 0, 70, nullptr },
+//   { OP_TEXT,  0, 0, 0, "https://example.com" },
+//   { OP_TAP,   0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+
+/* --------------------------
+   Discord (desktop)
+   -------------------------- */
+
+// Quick switcher (Ctrl+K) is common on Discord
+// static MacroStep const MACRO_DISCORD_QUICK_SWITCH[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_K, 0, nullptr },
+//   { OP_DELAY, 0, 0, 60, nullptr },
+//   { OP_TEXT, 0, 0, 0, "<CHANNEL_OR_USER>", },
+//   { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+// Mute / Deafen are often bound to Ctrl+Shift+M / Ctrl+Shift+D in some setups,
+// but many users customize these. Leave as placeholders.
+// static MacroStep const MACRO_DISCORD_MUTE_TOGGLE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_M, 0, nullptr },
+// };
+// static MacroStep const MACRO_DISCORD_DEAFEN_TOGGLE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_D, 0, nullptr },
+// };
+
+
+/* --------------------------
+   ChatGPT (in browser)
+   -------------------------- */
+
+// New chat (varies by UI; keyboard shortcuts may change).
+// The most reliable "macro" for ChatGPT is usually: focus URL bar and open a URL,
+// or type a prepared prompt into the text box once it's focused.
+// For now, provide safe building blocks:
+//
+// 1) Open ChatGPT in a new tab (URL placeholder)
+// static MacroStep const MACRO_CHATGPT_OPEN[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_T, 0, nullptr },   // new tab
+//   { OP_DELAY, 0, 0, 80, nullptr },
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_L, 0, nullptr },   // focus URL
+//   { OP_DELAY, 0, 0, 80, nullptr },
+//   { OP_TEXT, 0, 0, 0, "https://chatgpt.com" },
+//   { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+// 2) Type a prompt snippet (requires your cursor already in the message box)
+// static MacroStep const MACRO_CHATGPT_PROMPT_SNIPPET[] = {
+//   { OP_TEXT, 0, 0, 0, "<YOUR_PROMPT_TEXT>" },
+//   // If you want to "send" and Enter sends in your UI:
+//   // { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+
+/* --------------------------
+   VS Code
+   -------------------------- */
+
+// Command Palette (Ctrl+Shift+P)
+// static MacroStep const MACRO_VSCODE_COMMAND_PALETTE[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_P, 0, nullptr },
+// };
+
+// Quick Open (Ctrl+P)
+// static MacroStep const MACRO_VSCODE_QUICK_OPEN[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_P, 0, nullptr },
+//   { OP_DELAY, 0, 0, 50, nullptr },
+//   { OP_TEXT, 0, 0, 0, "<FILE_NAME>", },
+//   { OP_TAP, 0, HID_KEY_ENTER, 0, nullptr },
+// };
+
+// Toggle terminal (Ctrl+`), note: backtick is HID_KEY_GRAVE
+// static MacroStep const MACRO_VSCODE_TOGGLE_TERMINAL[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_GRAVE, 0, nullptr },
+// };
+
+// Format document (Shift+Alt+F on Windows by default in many setups)
+// static MacroStep const MACRO_VSCODE_FORMAT_DOC[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_LEFTALT, HID_KEY_F, 0, nullptr },
+// };
+
+// Comment line (Ctrl+/ in many editors; in HID it's usually Ctrl + HID_KEY_SLASH)
+// static MacroStep const MACRO_VSCODE_TOGGLE_COMMENT[] = {
+//   { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_SLASH, 0, nullptr },
+// };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ================================================================
+// 5) Low-level helpers to send key reports to the PC
+// ================================================================
+//
+// Everything you want the PC to "receive" goes through usb_hid.sendReport().
+//
+
+static inline void wait_hid_ready() {
+  while (!usb_hid.ready()) { yield(); }
+}
+
+static inline void send_report_to_pc(hid_keyboard_report_t const* r) {
+  wait_hid_ready();
+  usb_hid.sendReport(0, r, sizeof(hid_keyboard_report_t));
+}
+
+static inline void release_all_to_pc() {
+  hid_keyboard_report_t r = {};
+  send_report_to_pc(&r);
+}
+
+static void press_to_pc(uint8_t modifier, uint8_t keycode) {
+  hid_keyboard_report_t r = {};
+  r.modifier = modifier;
+  r.keycode[0] = keycode;
+  send_report_to_pc(&r);
+}
+
+static void tap_to_pc(uint8_t modifier, uint8_t keycode) {
+  press_to_pc(modifier, keycode);
+  delay(TAP_DOWN_MS);
+  release_all_to_pc();
+  delay(STEP_GAP_MS);
+}
+
+// Text typing support (ASCII to keycode + modifier)
+// Note: if your build complains this function is missing, comment out OP_TEXT usage.
+static bool ascii_to_kc(char c, uint8_t* out_kc, uint8_t* out_mod) {
+  return tud_hid_keyboard_get_keycode_from_ascii(c, out_kc, out_mod);
+}
+
+static void type_text_to_pc(char const* s) {
+  while (*s) {
+    uint8_t kc = 0, mod = 0;
+    if (ascii_to_kc(*s, &kc, &mod)) {
+      tap_to_pc(mod, kc);
+      if (TEXT_CHAR_GAP_MS) delay(TEXT_CHAR_GAP_MS);
+    }
+    s++;
+  }
+}
+
+
+// ================================================================
+// 6) Simple key remaps (key -> key), empty by default
+// ================================================================
+//
+// This is the easiest customization.
+// It edits the incoming report before sending it to the PC.
+//
+
+struct KeyRemap { uint8_t from_key; uint8_t to_key; };
+
+// Default: no remaps. Uncomment or add entries.
+static KeyRemap const key_remaps[] = {
+  // Common remap:
+  // { HID_KEY_CAPS_LOCK, HID_KEY_ESCAPE },
+
+  // Example remaps:
+  // { HID_KEY_GRAVE,     HID_KEY_ESCAPE },
+  // { HID_KEY_F1,        HID_KEY_F2 },
+};
+
+static void apply_key_remaps(hid_keyboard_report_t const* in, hid_keyboard_report_t* out) {
+  memcpy(out, in, sizeof(hid_keyboard_report_t));
+
+  for (uint8_t i = 0; i < 6; i++) {
+    uint8_t kc = out->keycode[i];
+    if (!kc) continue;
+
+    for (size_t j = 0; j < sizeof(key_remaps)/sizeof(KeyRemap); j++) {
+      if (kc == key_remaps[j].from_key) {
+        out->keycode[i] = key_remaps[j].to_key;
+        break;
+      }
+    }
+  }
+
+  // Optional example: swallow a key (disable it)
+  // for (uint8_t i = 0; i < 6; i++) {
+  //   if (out->keycode[i] == HID_KEY_CAPS_LOCK) out->keycode[i] = 0;
+  // }
+}
+
+
+// ================================================================
+// 7) Macro system (disabled by default)
+// ================================================================
+//
+// A macro triggers on a "new key down" edge so holding a key does not repeat.
+// When a macro triggers, we do not pass the trigger key through to the PC.
+// Instead, we send a sequence of steps.
+//
+// You enable macros by setting ENABLE_MACROS = true.
+//
+
+enum MacroOp : uint8_t {
+  OP_TAP,     // tap (modifier + key)
+  OP_DOWN,    // press (modifier + key), no release
+  OP_UP,      // release all keys
+  OP_DELAY,   // delay milliseconds
+  OP_TEXT     // type ASCII string
+};
+
+struct MacroStep {
+  MacroOp op;
+  uint8_t modifier;
+  uint8_t keycode;
+  uint16_t value;
+  char const* text;
+};
+
+static void run_macro(MacroStep const* steps, size_t nsteps) {
+  for (size_t i = 0; i < nsteps; i++) {
+    MacroStep const& st = steps[i];
+    switch (st.op) {
+      case OP_TAP:   tap_to_pc(st.modifier, st.keycode); break;
+      case OP_DOWN:  press_to_pc(st.modifier, st.keycode); delay(STEP_GAP_MS); break;
+      case OP_UP:    release_all_to_pc(); delay(STEP_GAP_MS); break;
+      case OP_DELAY: delay(st.value); break;
+      case OP_TEXT:  if (st.text) type_text_to_pc(st.text); break;
+      default: break;
+    }
+  }
+  release_all_to_pc();
+}
+
+struct MacroBinding {
+  uint8_t trigger_key;
+  uint8_t require_mod_mask; // must be present in incoming report->modifier
+  uint8_t forbid_mod_mask;  // must be absent in incoming report->modifier
+  MacroStep const* steps;
+  size_t nsteps;
+};
+
+
+// ------------------------------------------------
+// Example macros (commented out on purpose)
+// ------------------------------------------------
+//
+// Uncomment the macro(s) you want, then bind them below.
+// Keep text placeholders generic until you choose exact content.
+//
+
+/*
+
+static MacroStep const MACRO_COPY[] = {
+  { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_C, 0, nullptr },
+};
+
+static MacroStep const MACRO_PASTE[] = {
+  { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_V, 0, nullptr },
+};
+
+static MacroStep const MACRO_UNDO[] = {
+  { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_Z, 0, nullptr },
+};
+
+static MacroStep const MACRO_SAVE[] = {
+  { OP_TAP, KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_S, 0, nullptr },
+};
+
+static MacroStep const MACRO_ALT_TAB[] = {
+  { OP_TAP, KEYBOARD_MODIFIER_LEFTALT, HID_KEY_TAB, 0, nullptr },
+};
+
+// Type a snippet (edit placeholder text)
+static MacroStep const MACRO_SNIPPET[] = {
+  { OP_TEXT, 0, 0, 0, "<YOUR_TEXT>\n" },
+};
+
+// Open browser address bar and type a URL (URL is placeholder)
+static MacroStep const MACRO_OPEN_URL[] = {
+  { OP_TAP,   KEYBOARD_MODIFIER_LEFTCTRL, HID_KEY_L, 0, nullptr },
+  { OP_DELAY, 0, 0, 80, nullptr },
+  { OP_TEXT,  0, 0, 0, "https://example.com" },
+  { OP_TAP,   0, HID_KEY_ENTER, 0, nullptr },
+};
+
+*/
+
+
+// ------------------------------------------------
+// Macro bindings (empty by default)
+// ------------------------------------------------
+//
+// Add one line per macro trigger.
+// Good trigger keys are ones you never need for normal typing:
+//   - HID_KEY_F13..HID_KEY_F24 (if your keyboard has them)
+//   - keypad keys
+//   - a cheap secondary keyboard
+//
+// require_mod_mask / forbid_mod_mask let you make "layers":
+//   - Require Ctrl held: require_mod_mask = KEYBOARD_MODIFIER_LEFTCTRL
+//   - Only when no modifiers held: forbid_mod_mask = 0xFF
+//
+static MacroBinding const macro_bindings[] = {
+  // Default: no macros enabled
+
+  // Example bindings (uncomment after enabling macros above):
+  // { HID_KEY_F13, 0, 0, MACRO_COPY,  sizeof(MACRO_COPY)/sizeof(MacroStep) },
+  // { HID_KEY_F14, 0, 0, MACRO_PASTE, sizeof(MACRO_PASTE)/sizeof(MacroStep) },
+  // { HID_KEY_F15, 0, 0, MACRO_UNDO,  sizeof(MACRO_UNDO)/sizeof(MacroStep) },
+  // { HID_KEY_F16, 0, 0, MACRO_SAVE,  sizeof(MACRO_SAVE)/sizeof(MacroStep) },
+  // { HID_KEY_F17, 0, 0, MACRO_ALT_TAB, sizeof(MACRO_ALT_TAB)/sizeof(MacroStep) },
+  // { HID_KEY_F18, 0, 0, MACRO_SNIPPET, sizeof(MACRO_SNIPPET)/sizeof(MacroStep) },
+
+  // Trigger macro only on Ctrl+F1:
+  // { HID_KEY_F1, KEYBOARD_MODIFIER_LEFTCTRL, 0, MACRO_OPEN_URL, sizeof(MACRO_OPEN_URL)/sizeof(MacroStep) },
+
+  // Trigger macro only when no modifiers are held:
+  // { HID_KEY_F2, 0, 0xFF, MACRO_SNIPPET, sizeof(MACRO_SNIPPET)/sizeof(MacroStep) },
+};
+
+
+// ================================================================
+// 8) Edge detection: macro triggers fire once per press
+// ================================================================
+
+static hid_keyboard_report_t prev_report = {};
+
+static bool report_has_key(hid_keyboard_report_t const* r, uint8_t kc) {
+  for (uint8_t i = 0; i < 6; i++) {
+    if (r->keycode[i] == kc) return true;
+  }
+  return false;
+}
+
+static bool is_new_keydown(hid_keyboard_report_t const* now, uint8_t kc) {
+  return report_has_key(now, kc) && !report_has_key(&prev_report, kc);
+}
+
+static void debug_print_report(hid_keyboard_report_t const* r) {
+  if (!DEBUG_PRINT_REPORTS) return;
+
+  Serial.printf("mod=0x%02x keys=[", r->modifier);
+  for (uint8_t i = 0; i < 6; i++) {
+    Serial.printf("0x%02x", r->keycode[i]);
+    if (i < 5) Serial.print(",");
+  }
+  Serial.println("]");
+}
+
+static bool try_run_macro(hid_keyboard_report_t const* r) {
+  if (!ENABLE_MACROS) return false;
+
+  for (size_t i = 0; i < sizeof(macro_bindings)/sizeof(MacroBinding); i++) {
+    MacroBinding const& b = macro_bindings[i];
+
+    if (!is_new_keydown(r, b.trigger_key)) continue;
+
+    if (b.require_mod_mask && ((r->modifier & b.require_mod_mask) != b.require_mod_mask)) continue;
+    if (b.forbid_mod_mask  && ((r->modifier & b.forbid_mod_mask) != 0)) continue;
+
+    Serial.printf("Macro triggered by keycode=0x%02x\r\n", b.trigger_key);
+    run_macro(b.steps, b.nsteps);
+    return true;
+  }
+  return false;
+}
+
+
+// ================================================================
+// 9) setup / loop: RP2040 uses both cores
+// ================================================================
+//
+// Core0 runs USB device side (to PC).
+// Core1 runs USB host side (from keyboard) and calls USBHost.task().
+//
+// The host task produces callbacks like tuh_hid_report_received_cb() below.
+//
+
+void setup() {
+  Serial.begin(115200);
+
+  // Start USB device keyboard to PC
+  usb_hid.begin();
+
+#if defined(CFG_TUH_MAX3421) && CFG_TUH_MAX3421
+  // Non-RP2040 path: external host controller
+  USBHost.begin(1);
+#endif
+
+  Serial.println("RP2040 USB Host Remapper: pass-through default");
+  Serial.println("Check Tools -> USB Stack = Adafruit TinyUSB");
+  Serial.println("Check Tools -> CPU Speed = 120 or 240 MHz");
+  if (!ENABLE_MACROS) Serial.println("Macros are disabled. Set ENABLE_MACROS=true to use.");
+}
+
+#if defined(CFG_TUH_MAX3421) && CFG_TUH_MAX3421
+void loop() {
+  USBHost.task();
+}
+
+#elif defined(ARDUINO_ARCH_RP2040)
+void loop() {
+  // Core0: nothing required here for this example
+}
+
+void setup1() {
+  // Configures PIO USB host mode and VBUS enable, then starts host stack
+  rp2040_configure_pio_usb();
+  USBHost.begin(1);
+}
+
+void loop1() {
+  // Core1: keep host stack alive
+  USBHost.task();
+}
+#endif
+
+
+// ================================================================
+// 10) TinyUSB host callbacks: this is where remap/macro happens
+// ================================================================
+//
+// Every time the plugged-in keyboard reports a new state, this callback fires.
+// You receive an 8-byte "boot keyboard" report.
+//
+// Strategy:
+//   - Optionally print it for debugging
+//   - If a macro triggers, swallow original key and send macro events to PC
+//   - Else, apply key->key remaps and forward to PC (pass-through default)
+//
+
+extern "C" {
+
+void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
+                      uint8_t const* desc_report, uint16_t desc_len) {
+  (void) desc_report;
+  (void) desc_len;
+
+  uint16_t vid, pid;
+  tuh_vid_pid_get(dev_addr, &vid, &pid);
+
+  Serial.printf("HID mounted: addr=%d inst=%d VID=%04x PID=%04x\r\n",
+                dev_addr, instance, vid, pid);
+
+  uint8_t proto = tuh_hid_interface_protocol(dev_addr, instance);
+  if (proto == HID_ITF_PROTOCOL_KEYBOARD) {
+    Serial.println("HID keyboard detected");
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+      Serial.println("Error: cannot request report");
+    }
+  } else {
+    Serial.printf("Non-keyboard HID protocol=%d\r\n", proto);
+  }
+}
+
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
+  Serial.printf("HID unmounted: addr=%d inst=%d\r\n", dev_addr, instance);
+  memset(&prev_report, 0, sizeof(prev_report));
+}
+
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
+                                uint8_t const* report, uint16_t len) {
+  (void) dev_addr;
+  (void) instance;
+
+  if (len != 8) {
+    Serial.printf("Unexpected report length=%u (expected 8)\r\n", len);
+  } else {
+    hid_keyboard_report_t const* in = (hid_keyboard_report_t const*) report;
+
+    debug_print_report(in);
+
+    bool macro_ran = try_run_macro(in);
+    if (macro_ran) {
+      // Swallow trigger key and ensure PC sees "release"
+      release_all_to_pc();
+    } else if (PASS_THROUGH_DEFAULT) {
+      // Default behavior: remap table (empty by default) then forward
+      hid_keyboard_report_t out;
+      apply_key_remaps(in, &out);
+      send_report_to_pc(&out);
+    }
+  }
+
+  // Save report for edge detection in the next callback
+  if (len == 8) {
+    memcpy(&prev_report, report, sizeof(hid_keyboard_report_t));
+  } else {
+    memset(&prev_report, 0, sizeof(prev_report));
+  }
+
+  // Keep receiving
+  if (!tuh_hid_receive_report(dev_addr, instance)) {
+    Serial.println("Error: cannot request report");
+  }
+}
+
+} // extern "C"
